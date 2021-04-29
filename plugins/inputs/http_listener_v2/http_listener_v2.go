@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	tlsint "github.com/influxdata/telegraf/plugins/common/tls"
@@ -61,44 +62,34 @@ type HTTPListenerV2 struct {
 const sampleConfig = `
   ## Address and port to host HTTP listener on
   service_address = ":8080"
-
   ## Path to listen to.
   # path = "/telegraf"
-
   ## HTTP methods to accept.
   # methods = ["POST", "PUT"]
-
   ## maximum duration before timing out read of the request
   # read_timeout = "10s"
   ## maximum duration before timing out write of the response
   # write_timeout = "10s"
-
   ## Maximum allowed http request body size in bytes.
   ## 0 means to use the default of 524,288,00 bytes (500 mebibytes)
   # max_body_size = "500MB"
-
   ## Part of the request to consume.  Available options are "body" and
   ## "query".
   # data_source = "body"
-
   ## Set one or more allowed client CA certificate file names to
   ## enable mutually authenticated TLS connections
   # tls_allowed_cacerts = ["/etc/telegraf/clientca.pem"]
-
   ## Add service certificate and key
   # tls_cert = "/etc/telegraf/cert.pem"
   # tls_key = "/etc/telegraf/key.pem"
-
   ## Optional username and password to accept for HTTP basic authentication.
   ## You probably want to make sure you have TLS configured above for this.
   # basic_username = "foobar"
   # basic_password = "barfoo"
-
   ## Optional setting to map http headers into tags
   ## If the http header is not present on the request, no corresponding tag will be added
   ## If multiple instances of the http header are present, only the first value will be used
   # http_header_tags = {"HTTP_HEADER" = "TAG_NAME"}
-
   ## Data format to consume.
   ## Each data format has its own unique set of configuration options, read
   ## more about them here:
@@ -247,28 +238,50 @@ func (h *HTTPListenerV2) serveWrite(res http.ResponseWriter, req *http.Request) 
 }
 
 func (h *HTTPListenerV2) collectBody(res http.ResponseWriter, req *http.Request) ([]byte, bool) {
-	body := req.Body
+	encoding := req.Header.Get("Content-Encoding")
 
-	// Handle gzip request bodies
-	if req.Header.Get("Content-Encoding") == "gzip" {
-		var err error
-		body, err = gzip.NewReader(req.Body)
+	switch encoding {
+	case "gzip":
+		r, err := gzip.NewReader(req.Body)
 		if err != nil {
 			h.Log.Debug(err.Error())
 			badRequest(res)
 			return nil, false
 		}
-		defer body.Close()
+		defer r.Close()
+		maxReader := http.MaxBytesReader(res, r, h.MaxBodySize.Size)
+		bytes, err := ioutil.ReadAll(maxReader)
+		if err != nil {
+			tooLarge(res)
+			return nil, false
+		}
+		return bytes, true
+	case "snappy":
+		defer req.Body.Close()
+		bytes, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			h.Log.Debug(err.Error())
+			badRequest(res)
+			return nil, false
+		}
+		// snappy block format is only supported by decode/encode not snappy reader/writer
+		bytes, err = snappy.Decode(nil, bytes)
+		if err != nil {
+			h.Log.Debug(err.Error())
+			badRequest(res)
+			return nil, false
+		}
+		return bytes, true
+	default:
+		defer req.Body.Close()
+		bytes, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			h.Log.Debug(err.Error())
+			badRequest(res)
+			return nil, false
+		}
+		return bytes, true
 	}
-
-	body = http.MaxBytesReader(res, body, h.MaxBodySize.Size)
-	bytes, err := ioutil.ReadAll(body)
-	if err != nil {
-		tooLarge(res)
-		return nil, false
-	}
-
-	return bytes, true
 }
 
 func (h *HTTPListenerV2) collectQuery(res http.ResponseWriter, req *http.Request) ([]byte, bool) {
@@ -313,7 +326,6 @@ func (h *HTTPListenerV2) authenticateIfSet(handler http.HandlerFunc, res http.Re
 		if !ok ||
 			subtle.ConstantTimeCompare([]byte(reqUsername), []byte(h.BasicUsername)) != 1 ||
 			subtle.ConstantTimeCompare([]byte(reqPassword), []byte(h.BasicPassword)) != 1 {
-
 			http.Error(res, "Unauthorized.", http.StatusUnauthorized)
 			return
 		}
